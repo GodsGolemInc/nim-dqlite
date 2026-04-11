@@ -41,7 +41,7 @@ SQL層は両バックエンドで共通（SQLite互換SQL）。dqlite は SQLite
 - 本番移行時にアプリケーションコードの変更が不要
 
 ### Negative
-- dqlite バックエンドは未実装（TODO: wire protocol 対応）
+- ~~dqlite バックエンドは未実装（TODO: wire protocol 対応）~~ → 実装済み（protocol.nim + client.nim）
 - dqlite 固有の機能（ノード管理、クラスタ操作）はFFI経由で別途実装が必要
 
 ### Risks

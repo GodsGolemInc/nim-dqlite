@@ -4,8 +4,13 @@
 ## multi-threaded async bridge.
 
 import db_connector/db_sqlite as sqlite
+from db_connector/sqlite3 import PStmt, reset, clear_bindings, step,
+  SQLITE_OK, SQLITE_DONE, SQLITE_ROW
 export sqlite.DbError
 import std/[strutils, sequtils, asyncdispatch, locks, cpuinfo, nativesockets]
+import ./protocol as dqliteProto
+import ./client as dqliteClient
+export dqliteClient.DqliteConn
 
 when defined(posix):
   import std/posix
@@ -15,15 +20,66 @@ type
     dbSqlite = "sqlite"
     dbDqlite = "dqlite"
 
+  PragmaConfig* = object
+    ## SQLite PRAGMA configuration. Empty string / zero = not set.
+    journalMode*: string    ## "WAL", "DELETE", etc.
+    synchronous*: string    ## "OFF", "NORMAL", "FULL"
+    cacheSize*: int         ## negative = KiB, positive = pages
+    mmapSize*: int64        ## bytes
+    tempStore*: string      ## "MEMORY", "FILE"
+    busyTimeout*: int       ## milliseconds
+
   MasterDbObj = object
     backend*: DbBackend
-    conn: sqlite.DbConn
+    conn: sqlite.DbConn          ## SQLite connection (nil when dbDqlite)
+    dqconn: dqliteClient.DqliteConn  ## dqlite connection (nil when dbSqlite)
     path*: string
     lock: Lock
 
   MasterDb* = ref MasterDbObj
 
   Row* = seq[string]
+
+  DbValueKind* = enum
+    dvText
+    dvBlob
+
+  DbValue* = object
+    ## A database value that can be either text (bind_text) or binary (bind_blob).
+    ## Use `dbText()` and `dbBlob()` constructors.
+    case kind*: DbValueKind
+    of dvText: textVal*: string
+    of dvBlob: blobVal*: seq[byte]
+
+proc dbText*(s: string): DbValue {.raises: [].} =
+  ## Create a text DbValue.
+  DbValue(kind: dvText, textVal: s)
+
+proc dbBlob*(data: string): DbValue {.raises: [].} =
+  ## Create a blob DbValue from a string (e.g. compressed data).
+  var bytes = newSeq[byte](data.len)
+  for i, c in data:
+    bytes[i] = byte(c)
+  DbValue(kind: dvBlob, blobVal: bytes)
+
+proc dbBlob*(data: seq[byte]): DbValue {.raises: [].} =
+  ## Create a blob DbValue from raw bytes.
+  DbValue(kind: dvBlob, blobVal: data)
+
+const
+  PragmaDefault* = PragmaConfig()
+    ## No PRAGMAs applied. Backwards compatible default.
+
+  PragmaWAL* = PragmaConfig(
+    journalMode: "WAL", synchronous: "NORMAL", busyTimeout: 5000)
+    ## WAL mode with normal durability. Good for concurrent read/write.
+
+  PragmaPerformance* = PragmaConfig(
+    journalMode: "WAL", synchronous: "OFF",
+    cacheSize: -64000, mmapSize: 268435456,
+    tempStore: "MEMORY", busyTimeout: 5000)
+    ## Maximum write throughput. Use for batch imports where crash safety
+    ## is handled by rebuild (e.g. --rebuild flag).
 
 # --- Global Async Infrastructure ---
 
@@ -177,57 +233,168 @@ proc shutdownAsyncInfrastructure*() {.raises: [].} =
 
 # --- Public API ---
 
-proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sqlite.DbError].} =
-  ## Open a database connection. Initializes the global async worker pool
-  ## on first call (unless compiled with -d:noAsyncDb). Use `close` to release.
-  when not defined(noAsyncDb):
-    initAsyncInfrastructure()
-  let conn = case backend
-  of dbSqlite:
-    sqlite.open(path, "", "", "")
-  of dbDqlite:
-    # TODO: dqlite wire protocol support — currently falls back to SQLite
-    sqlite.open(path, "", "", "")
+proc applyPragmas*(db: MasterDb, config: PragmaConfig) {.raises: [sqlite.DbError].} =
+  ## Apply PRAGMA configuration to an open database connection.
+  ## Only sets PRAGMAs whose values are non-default (non-empty string / non-zero).
+  if config.journalMode.len > 0:
+    db.conn.exec(sqlite.sql("PRAGMA journal_mode=" & config.journalMode))
+  if config.synchronous.len > 0:
+    db.conn.exec(sqlite.sql("PRAGMA synchronous=" & config.synchronous))
+  if config.cacheSize != 0:
+    db.conn.exec(sqlite.sql("PRAGMA cache_size=" & $config.cacheSize))
+  if config.mmapSize != 0:
+    db.conn.exec(sqlite.sql("PRAGMA mmap_size=" & $config.mmapSize))
+  if config.tempStore.len > 0:
+    db.conn.exec(sqlite.sql("PRAGMA temp_store=" & config.tempStore))
+  if config.busyTimeout != 0:
+    db.conn.exec(sqlite.sql("PRAGMA busy_timeout=" & $config.busyTimeout))
 
-  let db = MasterDb(backend: backend, conn: conn, path: path)
-  initLock(db.lock)
-  db
+proc open*(path: string, backend: DbBackend = dbSqlite,
+           pragmas: PragmaConfig = PragmaDefault): MasterDb {.raises: [sqlite.DbError].} =
+  ## Open a database connection with optional PRAGMA configuration.
+  ## For dbSqlite: path is a file path.
+  ## For dbDqlite: path is comma-separated addresses ("host1:port1,host2:port2").
+  ## Initializes the global async worker pool on first call (unless compiled
+  ## with -d:noAsyncDb). Use `close` to release.
+  case backend
+  of dbSqlite:
+    when not defined(noAsyncDb):
+      initAsyncInfrastructure()
+    let conn = sqlite.open(path, "", "", "")
+    result = MasterDb(backend: backend, conn: conn, path: path)
+    initLock(result.lock)
+    if pragmas != PragmaDefault:
+      result.applyPragmas(pragmas)
+  of dbDqlite:
+    try:
+      let addresses = path.split(",").mapIt(it.strip())
+      let dqconn = dqliteClient.connect(addresses)
+      result = MasterDb(backend: backend, dqconn: dqconn, path: path)
+      initLock(result.lock)
+    except DqliteError as e:
+      raise newException(sqlite.DbError, "dqlite: " & e.msg)
 
 proc close*(db: MasterDb) {.raises: [].} =
   ## Close the database connection and release the lock.
-  ## Sets conn to nil to prevent use-after-close. Safe to call multiple times.
-  if not db.conn.isNil:
-    try:
-      db.conn.close()
-    except DbError:
-      discard  # best-effort close — connection is being released
-    db.conn = nil
+  ## Safe to call multiple times.
+  case db.backend
+  of dbSqlite:
+    if not db.conn.isNil:
+      try:
+        db.conn.close()
+      except DbError:
+        discard  # best-effort close
+      db.conn = nil
+  of dbDqlite:
+    if not db.dqconn.isNil:
+      db.dqconn.close()
+      db.dqconn = nil
   deinitLock(db.lock)
+
+proc toDqliteParams(args: openArray[string]): seq[DqliteValue] {.raises: [].} =
+  result = newSeq[DqliteValue](args.len)
+  for i, a in args:
+    result[i] = DqliteValue(kind: dvkText, textVal: a)
 
 proc exec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]) {.raises: [sqlite.DbError].} =
   ## Execute a SQL statement with parameterized arguments. Thread-safe.
-  withLock db.lock:
-    db.conn.exec(sqlite.sql(sqlStr), args)
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      db.conn.exec(sqlite.sql(sqlStr), args)
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        discard db.dqconn.execSQL(sqlStr, toDqliteParams(@args))
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
+
+proc execValues*(db: MasterDb, sqlStr: string,
+                 args: openArray[DbValue]) {.raises: [sqlite.DbError].} =
+  ## Execute a SQL statement with typed parameters (text or blob).
+  ## Uses prepared statements with proper bind_text / bind_blob.
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      let stmt = db.conn.prepare(sqlStr)
+      try:
+        for i, val in args:
+          case val.kind
+          of dvText:
+            sqlite.bindParam(stmt, i + 1, val.textVal)
+          of dvBlob:
+            sqlite.bindParam(stmt, i + 1, val.blobVal)
+        if not sqlite.tryExec(db.conn, stmt):
+          sqlite.dbError(db.conn)
+      finally:
+        sqlite.finalize(stmt)
+  of dbDqlite:
+    var params = newSeq[DqliteValue](args.len)
+    for i, val in args:
+      case val.kind
+      of dvText:
+        params[i] = DqliteValue(kind: dvkText, textVal: val.textVal)
+      of dvBlob:
+        params[i] = DqliteValue(kind: dvkBlob, blobVal: val.blobVal)
+    try:
+      withLock db.lock:
+        discard db.dqconn.execSQL(sqlStr, params)
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
 
 proc getAllRows*(db: MasterDb, query: string,
                 args: varargs[string, `$`]): seq[Row] {.raises: [sqlite.DbError].} =
   ## Execute a query and return all result rows. Thread-safe.
-  withLock db.lock:
-    result = db.conn.getAllRows(sqlite.sql(query), args)
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      result = db.conn.getAllRows(sqlite.sql(query), args)
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        let qr = db.dqconn.querySQL(query, toDqliteParams(@args))
+        for row in qr.rows:
+          var r = newSeq[string](row.len)
+          for i, val in row:
+            r[i] = dqliteValueToString(val)
+          result.add(r)
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
 
 proc getValue*(db: MasterDb, query: string,
                args: varargs[string, `$`]): string {.raises: [sqlite.DbError].} =
   ## Execute a query and return the first column of the first row. Thread-safe.
-  withLock db.lock:
-    result = db.conn.getValue(sqlite.sql(query), args)
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      result = db.conn.getValue(sqlite.sql(query), args)
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        let qr = db.dqconn.querySQL(query, toDqliteParams(@args))
+        if qr.rows.len > 0 and qr.rows[0].len > 0:
+          result = dqliteValueToString(qr.rows[0][0])
+        else:
+          result = ""
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
 
 proc tryExec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]): bool {.raises: [].} =
   ## Try to execute a SQL statement. Returns false on error without raising.
-  try:
-    withLock db.lock:
-      result = db.conn.tryExec(sqlite.sql(sqlStr), args)
-  except CatchableError:
-    result = false
+  case db.backend
+  of dbSqlite:
+    try:
+      withLock db.lock:
+        result = db.conn.tryExec(sqlite.sql(sqlStr), args)
+    except CatchableError:
+      result = false
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        discard db.dqconn.execSQL(sqlStr, toDqliteParams(@args))
+      result = true
+    except CatchableError:
+      result = false
 
 # --- Async API ---
 
@@ -526,14 +693,18 @@ proc validateTable*(table: string) {.raises: [sqlite.DbError].} =
   if table notin ValidTables:
     raise newException(sqlite.DbError, "Invalid table name: " & table)
 
-proc validateColumnName(name: string) {.raises: [sqlite.DbError].} =
+proc validateIdentifier*(name: string, kind: string) {.raises: [sqlite.DbError].} =
+  ## Validate that a SQL identifier (table/column name) contains only safe characters.
   if name.len == 0:
-    raise newException(sqlite.DbError, "Empty column name")
+    raise newException(sqlite.DbError, "Empty " & kind & " name")
   if name[0] notin {'a'..'z', 'A'..'Z', '_'}:
-    raise newException(sqlite.DbError, "Invalid column name: " & name)
+    raise newException(sqlite.DbError, "Invalid " & kind & " name: " & name)
   for c in name:
     if c notin {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
-      raise newException(sqlite.DbError, "Invalid column name: " & name)
+      raise newException(sqlite.DbError, "Invalid " & kind & " name: " & name)
+
+proc validateColumnName(name: string) {.raises: [sqlite.DbError].} =
+  validateIdentifier(name, "column")
 
 proc initSchema*(db: MasterDb, schema: string) {.raises: [sqlite.DbError].} =
   ## Execute semicolon-delimited schema DDL statements.
@@ -558,27 +729,159 @@ proc openDomainDb*(path: string, schema: string, backend: DbBackend = dbSqlite):
   db.initSchema(VersionsSchema & schema)
   db
 
+proc bulkInsert*(db: MasterDb, table: string, columns: seq[string],
+                 rows: seq[seq[string]], batchSize: int = 1000,
+                 onConflict: string = "OR REPLACE") {.raises: [sqlite.DbError].} =
+  ## Generic bulk insert using prepared statements for performance.
+  ## - Column names are validated against SQL identifier rules
+  ## - Table name validation is the caller's responsibility (use validateTable
+  ##   for medical schema, or validateIdentifier for format-only checks)
+  ## - Processes `batchSize` rows per transaction
+  ## - On error within a batch, rolls back that batch and raises
+  for h in columns: validateColumnName(h)
+  for i, row in rows:
+    if row.len != columns.len:
+      raise newException(sqlite.DbError,
+        "Row " & $i & " has " & $row.len & " columns, expected " & $columns.len)
+  if rows.len == 0: return
+  validateIdentifier(table, "table")
+
+  let placeholders = columns.mapIt("?").join(", ")
+  let cols = columns.join(", ")
+  let insertSql = "INSERT " & onConflict & " INTO " & table &
+                  " (" & cols & ") VALUES (" & placeholders & ")"
+
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      let stmt = db.conn.prepare(insertSql)
+      try:
+        var offset = 0
+        while offset < rows.len:
+          let batchEnd = min(offset + batchSize, rows.len)
+          db.conn.exec(sqlite.sql("BEGIN TRANSACTION"))
+          try:
+            for i in offset ..< batchEnd:
+              if reset(PStmt(stmt)) != SQLITE_OK:
+                sqlite.dbError(db.conn)
+              if clear_bindings(PStmt(stmt)) != SQLITE_OK:
+                sqlite.dbError(db.conn)
+              for j, val in rows[i]:
+                sqlite.bindParam(stmt, j + 1, val)
+              let rc = step(PStmt(stmt))
+              if rc notin [SQLITE_DONE, SQLITE_ROW]:
+                sqlite.dbError(db.conn)
+            db.conn.exec(sqlite.sql("COMMIT"))
+          except CatchableError as e:
+            discard db.conn.tryExec(sqlite.sql("ROLLBACK"))
+            raise newException(sqlite.DbError, e.msg)
+          offset = batchEnd
+      finally:
+        sqlite.finalize(stmt)
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        var offset = 0
+        while offset < rows.len:
+          let batchEnd = min(offset + batchSize, rows.len)
+          discard db.dqconn.execSQL("BEGIN TRANSACTION")
+          try:
+            for i in offset ..< batchEnd:
+              discard db.dqconn.execSQL(insertSql, toDqliteParams(rows[i]))
+            discard db.dqconn.execSQL("COMMIT")
+          except DqliteError as e:
+            try: discard db.dqconn.execSQL("ROLLBACK")
+            except DqliteError as rollbackErr:
+              raise newDqliteError(e.code,
+                e.msg & " (ROLLBACK also failed: " & rollbackErr.msg & ")")
+            raise
+          offset = batchEnd
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
+
+proc bulkInsertValues*(db: MasterDb, table: string, columns: seq[string],
+                       rows: seq[seq[DbValue]], batchSize: int = 1000,
+                       onConflict: string = "OR REPLACE") {.raises: [sqlite.DbError].} =
+  ## Generic bulk insert with typed parameters (text or blob).
+  ## Like `bulkInsert` but uses DbValue for proper bind_text / bind_blob.
+  for h in columns: validateColumnName(h)
+  for i, row in rows:
+    if row.len != columns.len:
+      raise newException(sqlite.DbError,
+        "Row " & $i & " has " & $row.len & " columns, expected " & $columns.len)
+  if rows.len == 0: return
+  validateIdentifier(table, "table")
+
+  let placeholders = columns.mapIt("?").join(", ")
+  let cols = columns.join(", ")
+  let insertSql = "INSERT " & onConflict & " INTO " & table &
+                  " (" & cols & ") VALUES (" & placeholders & ")"
+
+  case db.backend
+  of dbSqlite:
+    withLock db.lock:
+      let stmt = db.conn.prepare(insertSql)
+      try:
+        var offset = 0
+        while offset < rows.len:
+          let batchEnd = min(offset + batchSize, rows.len)
+          db.conn.exec(sqlite.sql("BEGIN TRANSACTION"))
+          try:
+            for i in offset ..< batchEnd:
+              if reset(PStmt(stmt)) != SQLITE_OK:
+                sqlite.dbError(db.conn)
+              if clear_bindings(PStmt(stmt)) != SQLITE_OK:
+                sqlite.dbError(db.conn)
+              for j, val in rows[i]:
+                case val.kind
+                of dvText:
+                  sqlite.bindParam(stmt, j + 1, val.textVal)
+                of dvBlob:
+                  sqlite.bindParam(stmt, j + 1, val.blobVal)
+              let rc = step(PStmt(stmt))
+              if rc notin [SQLITE_DONE, SQLITE_ROW]:
+                sqlite.dbError(db.conn)
+            db.conn.exec(sqlite.sql("COMMIT"))
+          except CatchableError as e:
+            discard db.conn.tryExec(sqlite.sql("ROLLBACK"))
+            raise newException(sqlite.DbError, e.msg)
+          offset = batchEnd
+      finally:
+        sqlite.finalize(stmt)
+  of dbDqlite:
+    try:
+      withLock db.lock:
+        var offset = 0
+        while offset < rows.len:
+          let batchEnd = min(offset + batchSize, rows.len)
+          discard db.dqconn.execSQL("BEGIN TRANSACTION")
+          try:
+            for i in offset ..< batchEnd:
+              var params = newSeq[DqliteValue](rows[i].len)
+              for j, val in rows[i]:
+                case val.kind
+                of dvText:
+                  params[j] = DqliteValue(kind: dvkText, textVal: val.textVal)
+                of dvBlob:
+                  params[j] = DqliteValue(kind: dvkBlob, blobVal: val.blobVal)
+              discard db.dqconn.execSQL(insertSql, params)
+            discard db.dqconn.execSQL("COMMIT")
+          except DqliteError as e:
+            try: discard db.dqconn.execSQL("ROLLBACK")
+            except DqliteError as rollbackErr:
+              raise newDqliteError(e.code,
+                e.msg & " (ROLLBACK also failed: " & rollbackErr.msg & ")")
+            raise
+          offset = batchEnd
+    except DqliteError as e:
+      raise newException(sqlite.DbError, e.msg)
+
 proc importCsvRows*(db: MasterDb, table: string, headers: seq[string],
                     rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
-  ## Import rows using INSERT OR REPLACE in a transaction with ROLLBACK on error.
-  ## Table and column names are validated against whitelist/format rules.
+  ## Import rows using INSERT OR REPLACE in a single transaction with ROLLBACK
+  ## on error. Table name is validated against the medical schema whitelist.
   validateTable(table)
-  for h in headers: validateColumnName(h)
-  for i, row in rows:
-    if row.len != headers.len:
-      raise newException(sqlite.DbError,
-        "Row " & $i & " has " & $row.len & " columns, expected " & $headers.len)
-  let placeholders = headers.mapIt("?").join(", ")
-  let cols = headers.join(", ")
-  let insertSql = "INSERT OR REPLACE INTO " & table & " (" & cols & ") VALUES (" & placeholders & ")"
-  db.exec("BEGIN TRANSACTION")
-  try:
-    for row in rows:
-      db.exec(insertSql, row)
-    db.exec("COMMIT")
-  except sqlite.DbError:
-    discard db.tryExec("ROLLBACK")
-    raise
+  db.bulkInsert(table, headers, rows, batchSize = rows.len)
 
 proc recordCount*(db: MasterDb, table: string): int {.raises: [sqlite.DbError, ValueError].} =
   ## Return the total number of rows in a table. Table name is validated.
@@ -669,26 +972,10 @@ proc importCsvRowsVersioned*(db: MasterDb, table: string, revision: string,
                              rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
   ## Like `importCsvRows` but auto-adds a 'revision' column if not in headers.
   validateTable(table)
-  for h in headers: validateColumnName(h)
-  for i, row in rows:
-    if row.len != headers.len:
-      raise newException(sqlite.DbError,
-        "Row " & $i & " has " & $row.len & " columns, expected " & $headers.len)
   var actualHeaders = headers
   var actualRows = rows
   if "revision" notin headers:
     actualHeaders.add("revision")
     for i in 0 ..< actualRows.len:
       actualRows[i].add(revision)
-  let placeholders = actualHeaders.mapIt("?").join(", ")
-  let cols = actualHeaders.join(", ")
-  let insertSql = "INSERT OR REPLACE INTO " & table &
-                  " (" & cols & ") VALUES (" & placeholders & ")"
-  db.exec("BEGIN TRANSACTION")
-  try:
-    for row in actualRows:
-      db.exec(insertSql, row)
-    db.exec("COMMIT")
-  except sqlite.DbError:
-    discard db.tryExec("ROLLBACK")
-    raise
+  db.bulkInsert(table, actualHeaders, actualRows, batchSize = actualRows.len)
