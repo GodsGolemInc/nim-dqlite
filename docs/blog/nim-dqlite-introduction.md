@@ -187,4 +187,4 @@ nimble install https://github.com/GodsGolemInc/nim-dqlite
 
 - GitHub: [GodsGolemInc/nim-dqlite](https://github.com/GodsGolemInc/nim-dqlite)
 - ADR: [docs/adr/](../adr/)
-- License: MIT
+- License: Apache-2.0

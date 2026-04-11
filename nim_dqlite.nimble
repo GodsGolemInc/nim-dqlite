@@ -2,7 +2,7 @@
 version = "0.1.0"
 author = "jasagiri"
 description = "dqlite bindings and SQLite-compatible database abstraction for medical master data"
-license = "MIT"
+license = "Apache-2.0"
 
 # Dependencies
 requires "nim >= 2.0.0"

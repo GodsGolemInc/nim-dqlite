@@ -130,4 +130,4 @@ Runs 52 tests: 9 unit tests (std/unittest) + 43 property-based tests (balls fram
 
 ## License
 
-MIT
+Apache-2.0
