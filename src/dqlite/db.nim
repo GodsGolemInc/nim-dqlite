@@ -25,10 +25,6 @@ type
 
   Row* = seq[string]
 
-  MasterRow* = object
-    columns*: seq[string]
-    values*: Row
-
 # --- Global Async Infrastructure ---
 
 type
@@ -40,9 +36,10 @@ type
     args: seq[string]
     futPtr: pointer
 
-  ResultKind = enum resVoid, msgRows, resString, resError
+  ResultKind = enum resVoid, resRows, resString, resError
   ResultMsg = object
     kind: ResultKind
+    origKind: AsyncKind
     dbPtr: pointer
     futPtr: pointer
     errorMsg: string
@@ -66,9 +63,9 @@ proc execWorker(msg: AsyncMsg) {.gcsafe.} =
   try:
     withLock db.lock:
       db.conn.exec(sqlite.sql(msg.query), msg.args)
-    resultChannel.send(ResultMsg(kind: resVoid, dbPtr: msg.dbPtr, futPtr: msg.futPtr))
+    resultChannel.send(ResultMsg(kind: resVoid, origKind: msgExec, dbPtr: msg.dbPtr, futPtr: msg.futPtr))
   except Exception as e:
-    resultChannel.send(ResultMsg(kind: resError, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
+    resultChannel.send(ResultMsg(kind: resError, origKind: msgExec, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
 
 proc getAllRowsWorker(msg: AsyncMsg) {.gcsafe.} =
   let db {.cursor.} = cast[MasterDb](msg.dbPtr)
@@ -76,9 +73,9 @@ proc getAllRowsWorker(msg: AsyncMsg) {.gcsafe.} =
     var rows: seq[Row]
     withLock db.lock:
       rows = db.conn.getAllRows(sqlite.sql(msg.query), msg.args)
-    resultChannel.send(ResultMsg(kind: msgRows, dbPtr: msg.dbPtr, futPtr: msg.futPtr, rows: rows))
+    resultChannel.send(ResultMsg(kind: resRows, origKind: msgGetAllRows, dbPtr: msg.dbPtr, futPtr: msg.futPtr, rows: rows))
   except Exception as e:
-    resultChannel.send(ResultMsg(kind: resError, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
+    resultChannel.send(ResultMsg(kind: resError, origKind: msgGetAllRows, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
 
 proc getValueWorker(msg: AsyncMsg) {.gcsafe.} =
   let db {.cursor.} = cast[MasterDb](msg.dbPtr)
@@ -86,9 +83,9 @@ proc getValueWorker(msg: AsyncMsg) {.gcsafe.} =
     var val: string
     withLock db.lock:
       val = db.conn.getValue(sqlite.sql(msg.query), msg.args)
-    resultChannel.send(ResultMsg(kind: resString, dbPtr: msg.dbPtr, futPtr: msg.futPtr, val: val))
+    resultChannel.send(ResultMsg(kind: resString, origKind: msgGetValue, dbPtr: msg.dbPtr, futPtr: msg.futPtr, val: val))
   except Exception as e:
-    resultChannel.send(ResultMsg(kind: resError, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
+    resultChannel.send(ResultMsg(kind: resError, origKind: msgGetValue, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
 
 proc workerLoop() {.gcsafe.} =
   while true:
@@ -109,7 +106,7 @@ proc pollResults(fd: AsyncFD): bool {.gcsafe.} =
         let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
         if not fut.finished: fut.complete()
         GC_unref(fut)
-      of msgRows:
+      of resRows:
         let fut {.cursor.} = cast[Future[seq[Row]]](res.msg.futPtr)
         if not fut.finished: fut.complete(res.msg.rows)
         GC_unref(fut)
@@ -118,9 +115,21 @@ proc pollResults(fd: AsyncFD): bool {.gcsafe.} =
         if not fut.finished: fut.complete(res.msg.val)
         GC_unref(fut)
       of resError:
-        let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
-        if not fut.finished: fut.fail(newException(sqlite.DbError, res.msg.errorMsg))
-        GC_unref(fut)
+        let err = newException(sqlite.DbError, res.msg.errorMsg)
+        case res.msg.origKind
+        of msgExec:
+          let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
+          if not fut.finished: fut.fail(err)
+          GC_unref(fut)
+        of msgGetAllRows:
+          let fut {.cursor.} = cast[Future[seq[Row]]](res.msg.futPtr)
+          if not fut.finished: fut.fail(err)
+          GC_unref(fut)
+        of msgGetValue:
+          let fut {.cursor.} = cast[Future[string]](res.msg.futPtr)
+          if not fut.finished: fut.fail(err)
+          GC_unref(fut)
+        of msgQuit: discard
       GC_unref(db)
     else:
       break
@@ -161,6 +170,7 @@ proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sql
   of dbSqlite:
     sqlite.open(path, "", "", "")
   of dbDqlite:
+    # TODO: dqlite wire protocol support — currently falls back to SQLite
     sqlite.open(path, "", "", "")
   
   let db = MasterDb(backend: backend, conn: conn, path: path)
@@ -170,6 +180,7 @@ proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sql
 proc close*(db: MasterDb) =
   if not db.conn.isNil:
     db.conn.close()
+    db.conn = nil
   deinitLock(db.lock)
 
 proc exec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]) {.raises: [sqlite.DbError].} =
@@ -465,6 +476,32 @@ const KangoSchema* = """
 
 const MedicalMasterSchema* = VersionsSchema & ShinryoSchema & IyakuhinSchema & ByomeiSchema & HoumonKangoSchema & ShikaSchema & DpcSchema & KensaSchema & KaigoSchema & KangoSchema
 
+const ValidTables* = [
+  "master_versions",
+  "shinryo_koui", "chouzai",
+  "iyakuhin", "tokutei_kizai", "formulary",
+  "byomei", "shuushokugo",
+  "houmon_kango", "houmon_kango_kasan", "houmon_kango_kaisu", "houmon_kango_haihan",
+  "shika_shinryo", "shishiki",
+  "dpc_mdc", "dpc_bunrui", "dpc_icd", "dpc_tensu",
+  "kensa",
+  "kaigo_service",
+  "kango_jissen",
+]
+
+proc validateTable*(table: string) {.raises: [sqlite.DbError].} =
+  if table notin ValidTables:
+    raise newException(sqlite.DbError, "Invalid table name: " & table)
+
+proc validateColumnName(name: string) {.raises: [sqlite.DbError].} =
+  if name.len == 0:
+    raise newException(sqlite.DbError, "Empty column name")
+  if name[0] notin {'a'..'z', 'A'..'Z', '_'}:
+    raise newException(sqlite.DbError, "Invalid column name: " & name)
+  for c in name:
+    if c notin {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
+      raise newException(sqlite.DbError, "Invalid column name: " & name)
+
 proc initSchema*(db: MasterDb, schema: string) {.raises: [sqlite.DbError].} =
   for statement in schema.split(";"):
     let trimmed = statement.strip()
@@ -486,20 +523,28 @@ proc openDomainDb*(path: string, schema: string, backend: DbBackend = dbSqlite):
 
 proc importCsvRows*(db: MasterDb, table: string, headers: seq[string],
                     rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
+  validateTable(table)
+  for h in headers: validateColumnName(h)
   let placeholders = headers.mapIt("?").join(", ")
   let cols = headers.join(", ")
   let insertSql = "INSERT OR REPLACE INTO " & table & " (" & cols & ") VALUES (" & placeholders & ")"
   db.exec("BEGIN TRANSACTION")
-  for row in rows:
-    db.exec(insertSql, row)
-  db.exec("COMMIT")
+  try:
+    for row in rows:
+      db.exec(insertSql, row)
+    db.exec("COMMIT")
+  except sqlite.DbError:
+    discard db.tryExec("ROLLBACK")
+    raise
 
 proc recordCount*(db: MasterDb, table: string): int {.raises: [sqlite.DbError, ValueError].} =
+  validateTable(table)
   let val = db.getValue("SELECT COUNT(*) FROM " & table)
   if val.len == 0: 0 else: parseInt(val)
 
 proc recordCountByRevision*(db: MasterDb, table: string,
                             revision: string): int {.raises: [sqlite.DbError, ValueError].} =
+  validateTable(table)
   let val = db.getValue(
     "SELECT COUNT(*) FROM " & table & " WHERE revision = ?", revision)
   if val.len == 0: 0 else: parseInt(val)
@@ -562,6 +607,7 @@ proc activateRevision*(db: MasterDb, revision, masterType: string) {.raises: [sq
     revision, masterType)
 
 proc purgeRevision*(db: MasterDb, revision, masterType, table: string) {.raises: [sqlite.DbError].} =
+  validateTable(table)
   db.exec("DELETE FROM " & table & " WHERE revision = ?", revision)
   db.exec(
     "DELETE FROM master_versions WHERE revision = ? AND master_type = ?",
@@ -570,6 +616,8 @@ proc purgeRevision*(db: MasterDb, revision, masterType, table: string) {.raises:
 proc importCsvRowsVersioned*(db: MasterDb, table: string, revision: string,
                              headers: seq[string],
                              rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
+  validateTable(table)
+  for h in headers: validateColumnName(h)
   var actualHeaders = headers
   var actualRows = rows
   if "revision" notin headers:
@@ -581,6 +629,10 @@ proc importCsvRowsVersioned*(db: MasterDb, table: string, revision: string,
   let insertSql = "INSERT OR REPLACE INTO " & table &
                   " (" & cols & ") VALUES (" & placeholders & ")"
   db.exec("BEGIN TRANSACTION")
-  for row in actualRows:
-    db.exec(insertSql, row)
-  db.exec("COMMIT")
+  try:
+    for row in actualRows:
+      db.exec(insertSql, row)
+    db.exec("COMMIT")
+  except sqlite.DbError:
+    discard db.tryExec("ROLLBACK")
+    raise

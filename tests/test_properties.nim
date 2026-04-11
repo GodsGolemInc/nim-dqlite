@@ -690,3 +690,73 @@ suite "property: stress randomized":
       db.exec("INSERT INTO kensa (code, revision, name) VALUES (?, ?, ?)",
               "POST_" & $i, "r1", "後続検査" & $i)
     check db.recordCountByRevision("kensa", "r1") == 300
+
+suite "property: input validation":
+
+  ## Given invalid table name When used in recordCount Then DbError raised
+  block validate_table_recordcount:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "val_table")
+    defer: db.close(); removeDir(dir)
+    var raised = false
+    try:
+      discard db.recordCount("'; DROP TABLE master_versions; --")
+    except:
+      raised = true
+    check raised
+    # Original table must still exist
+    check db.recordCount("master_versions") == 0
+
+  ## Given invalid table name When used in importCsvRows Then DbError raised
+  block validate_table_import:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "val_import")
+    defer: db.close(); removeDir(dir)
+    var raised = false
+    try:
+      db.importCsvRows("evil_table", @["code"], @[@["X"]])
+    except:
+      raised = true
+    check raised
+
+  ## Given invalid column name When used in importCsvRows Then DbError raised
+  block validate_column_name:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "val_col")
+    defer: db.close(); removeDir(dir)
+    var raised = false
+    try:
+      db.importCsvRows("shinryo_koui", @["code; DROP TABLE"], @[@["X"]])
+    except:
+      raised = true
+    check raised
+
+  ## Given valid table name When used Then no error
+  block validate_table_ok:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "val_ok")
+    defer: db.close(); removeDir(dir)
+    check db.recordCount("shinryo_koui") == 0
+    check db.recordCount("iyakuhin") == 0
+    check db.recordCount("master_versions") == 0
+
+suite "property: transaction rollback":
+
+  ## Given importCsvRows with column count mismatch When error Then no partial data
+  block rollback_on_error:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "rollback")
+    defer: db.close(); removeDir(dir)
+    let headers = @["code", "revision", "name", "tensu"]
+    let rows = @[
+      @["R001", "rev1", "正常行", "100"],
+      @["R002", "rev1", "列数不足"],  # 4列必要なのに3列 → SQLite error
+    ]
+    var raised = false
+    try:
+      db.importCsvRows("shinryo_koui", headers, rows)
+    except:
+      raised = true
+    check raised
+    # ROLLBACK により部分データが残らない
+    check db.recordCount("shinryo_koui") == 0
