@@ -179,8 +179,9 @@ proc shutdownAsyncInfrastructure*() {.raises: [].} =
 
 proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sqlite.DbError].} =
   ## Open a database connection. Initializes the global async worker pool
-  ## on first call. Use `close` to release when done.
-  initAsyncInfrastructure()
+  ## on first call (unless compiled with -d:noAsyncDb). Use `close` to release.
+  when not defined(noAsyncDb):
+    initAsyncInfrastructure()
   let conn = case backend
   of dbSqlite:
     sqlite.open(path, "", "", "")

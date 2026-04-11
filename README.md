@@ -7,8 +7,18 @@ SQLite/dqlite database abstraction for medical master data in Nim.
 
 ## Install
 
+### From nimble
+
+```bash
+nimble install https://github.com/GodsGolemInc/nim-dqlite
 ```
-nimble install https://github.com/jasagiri/nim-dqlite
+
+### From source
+
+```bash
+git clone https://github.com/GodsGolemInc/nim-dqlite.git
+cd nim-dqlite
+nimble test
 ```
 
 ### Dependencies
@@ -17,6 +27,13 @@ nimble install https://github.com/jasagiri/nim-dqlite
 - [db_connector](https://github.com/nim-lang/db_connector) >= 0.1.0
 - [balls](https://github.com/jasagiri/balls/tree/macos-support) (test only)
 - [insideout](https://github.com/jasagiri/insideout/tree/fix-mac-compilation-eintr) (test only, via balls)
+
+### Generate API docs
+
+```bash
+nim doc --project --index:on --path:src src/dqlite.nim
+# Output: src/htmldocs/
+```
 
 ## Quick Start
 
@@ -104,7 +121,12 @@ db.purgeRevision("2023.04", "shinryo_koui", "shinryo_koui")
 nimble test
 ```
 
-Runs both unit tests (std/unittest) and property-based tests (balls framework, 40 tests covering injection resistance, concurrency, huge payloads, boundary values, etc.).
+Runs 52 tests: 9 unit tests (std/unittest) + 43 property-based tests (balls framework) covering injection resistance, concurrent async, huge payloads, boundary values, transaction rollback, and lifecycle safety.
+
+## Documentation
+
+- [Architecture Decision Records](docs/adr/) (5 ADRs)
+- [Introduction blog post](docs/blog/nim-dqlite-introduction.md)
 
 ## License
 
