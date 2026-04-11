@@ -1,4 +1,4 @@
-import std/[unittest, os, strutils, times]
+import std/[unittest, os, times]
 import dqlite
 
 suite "medical master db":

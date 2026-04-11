@@ -225,7 +225,7 @@ proc tryExec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]): bool {.
   try:
     withLock db.lock:
       result = db.conn.tryExec(sqlite.sql(sqlStr), args)
-  except:
+  except CatchableError:
     result = false
 
 # --- Async API ---

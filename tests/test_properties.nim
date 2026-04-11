@@ -256,7 +256,7 @@ suite "property: error resilience":
       else:
         try:
           waitFor db.execAsync("INVALID SQL STATEMENT " & $i)
-        except:
+        except CatchableError:
           discard
     let finalCount = waitFor db.getValueAsync(
       "SELECT COUNT(*) FROM master_versions WHERE master_type = 'stress'")
@@ -270,7 +270,7 @@ suite "property: error resilience":
     for i in 1..50:
       try:
         waitFor db.execAsync("SELECT * FROM THIS_TABLE_DOES_NOT_EXIST_" & $i)
-      except:
+      except CatchableError:
         discard
     # Workers should still be alive and functional
     waitFor db.execAsync(
@@ -570,7 +570,7 @@ suite "property: multi-table CRUD":
     try:
       db.exec("INSERT INTO shinryo_koui (code, revision, name, tensu) VALUES (?, ?, ?, ?)",
               "PK001", "r1", "再診料", "73")
-    except:
+    except CatchableError:
       caught = true
     check caught
 
@@ -641,7 +641,7 @@ suite "property: boundary values":
     try:
       db.exec("INSERT INTO master_versions (revision, master_type, imported_at) VALUES (?, ?, ?)",
               withNul, "nul_test", "now")
-    except:
+    except CatchableError:
       raised = true
     check raised
 
@@ -701,7 +701,7 @@ suite "property: input validation":
     var raised = false
     try:
       discard db.recordCount("'; DROP TABLE master_versions; --")
-    except:
+    except CatchableError:
       raised = true
     check raised
     # Original table must still exist
@@ -715,7 +715,7 @@ suite "property: input validation":
     var raised = false
     try:
       db.importCsvRows("evil_table", @["code"], @[@["X"]])
-    except:
+    except CatchableError:
       raised = true
     check raised
 
@@ -727,7 +727,7 @@ suite "property: input validation":
     var raised = false
     try:
       db.importCsvRows("shinryo_koui", @["code; DROP TABLE"], @[@["X"]])
-    except:
+    except CatchableError:
       raised = true
     check raised
 
@@ -755,8 +755,49 @@ suite "property: transaction rollback":
     var raised = false
     try:
       db.importCsvRows("shinryo_koui", headers, rows)
-    except:
+    except CatchableError:
       raised = true
     check raised
     # ROLLBACK により部分データが残らない
     check db.recordCount("shinryo_koui") == 0
+
+suite "property: lifecycle and error paths":
+
+  ## Given db When closed twice Then no crash
+  block double_close:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "dbl_close")
+    db.close()
+    db.close()  # second close should be safe (nil check)
+    removeDir(dir)
+
+  ## Given async getValueAsync with invalid SQL When error Then correct type propagation
+  block async_getvalue_error:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "async_val_err")
+    defer: db.close(); removeDir(dir)
+    var raised = false
+    try:
+      discard waitFor db.getValueAsync("SELECT * FROM nonexistent_table_xyz")
+    except CatchableError:
+      raised = true
+    check raised
+    # DB should still work after error
+    let val = waitFor db.getValueAsync(
+      "SELECT COUNT(*) FROM master_versions")
+    check val == "0"
+
+  ## Given async getAllRowsAsync with invalid SQL When error Then correct type propagation
+  block async_getallrows_error:
+    let dir = makeSuiteDir()
+    let db = freshDb(dir, "async_rows_err")
+    defer: db.close(); removeDir(dir)
+    var raised = false
+    try:
+      discard waitFor db.getAllRowsAsync("INVALID QUERY FOR ROWS")
+    except CatchableError:
+      raised = true
+    check raised
+    let rows = waitFor db.getAllRowsAsync(
+      "SELECT * FROM master_versions")
+    check rows.len == 0
