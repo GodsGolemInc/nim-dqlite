@@ -17,9 +17,9 @@ type
 
   MasterDbObj = object
     backend*: DbBackend
-    conn*: sqlite.DbConn
+    conn: sqlite.DbConn
     path*: string
-    lock*: Lock
+    lock: Lock
 
   MasterDb* = ref MasterDbObj
 
@@ -162,9 +162,24 @@ proc initAsyncInfrastructure() {.raises: [sqlite.DbError].} =
   except Exception as e:
     raise newException(sqlite.DbError, "Failed to initialize async infrastructure: " & e.msg)
 
+proc shutdownAsyncInfrastructure*() {.raises: [].} =
+  ## Gracefully shut down the async worker pool. Sends quit messages to all
+  ## workers and joins their threads. Call before process exit for clean shutdown.
+  if not infrastructureInitialized: return
+  for i in 0 ..< workerThreads.len:
+    taskChannel.send(AsyncMsg(kind: msgQuit))
+  for i in 0 ..< workerThreads.len:
+    joinThread(workerThreads[i])
+  taskChannel.close()
+  resultChannel.close()
+  dummyFd.close()
+  infrastructureInitialized = false
+
 # --- Public API ---
 
 proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sqlite.DbError].} =
+  ## Open a database connection. Initializes the global async worker pool
+  ## on first call. Use `close` to release when done.
   initAsyncInfrastructure()
   let conn = case backend
   of dbSqlite:
@@ -172,38 +187,51 @@ proc open*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sql
   of dbDqlite:
     # TODO: dqlite wire protocol support — currently falls back to SQLite
     sqlite.open(path, "", "", "")
-  
+
   let db = MasterDb(backend: backend, conn: conn, path: path)
   initLock(db.lock)
   db
 
-proc close*(db: MasterDb) =
+proc close*(db: MasterDb) {.raises: [].} =
+  ## Close the database connection and release the lock.
+  ## Sets conn to nil to prevent use-after-close. Safe to call multiple times.
   if not db.conn.isNil:
-    db.conn.close()
+    try:
+      db.conn.close()
+    except DbError:
+      discard  # best-effort close — connection is being released
     db.conn = nil
   deinitLock(db.lock)
 
 proc exec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]) {.raises: [sqlite.DbError].} =
+  ## Execute a SQL statement with parameterized arguments. Thread-safe.
   withLock db.lock:
     db.conn.exec(sqlite.sql(sqlStr), args)
 
 proc getAllRows*(db: MasterDb, query: string,
                 args: varargs[string, `$`]): seq[Row] {.raises: [sqlite.DbError].} =
+  ## Execute a query and return all result rows. Thread-safe.
   withLock db.lock:
     result = db.conn.getAllRows(sqlite.sql(query), args)
 
 proc getValue*(db: MasterDb, query: string,
                args: varargs[string, `$`]): string {.raises: [sqlite.DbError].} =
+  ## Execute a query and return the first column of the first row. Thread-safe.
   withLock db.lock:
     result = db.conn.getValue(sqlite.sql(query), args)
 
-proc tryExec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]): bool =
-  withLock db.lock:
-    result = db.conn.tryExec(sqlite.sql(sqlStr), args)
+proc tryExec*(db: MasterDb, sqlStr: string, args: varargs[string, `$`]): bool {.raises: [].} =
+  ## Try to execute a SQL statement. Returns false on error without raising.
+  try:
+    withLock db.lock:
+      result = db.conn.tryExec(sqlite.sql(sqlStr), args)
+  except:
+    result = false
 
 # --- Async API ---
 
-proc execAsync*(db: MasterDb, query: string, args: varargs[string, `$`]): Future[void] =
+proc execAsync*(db: MasterDb, query: string, args: varargs[string, `$`]): Future[void] {.raises: [].} =
+  ## Async version of `exec`. Dispatched to a worker thread.
   let fut = newFuture[void]("execAsync")
   let a = @args
   GC_ref(db)
@@ -212,7 +240,8 @@ proc execAsync*(db: MasterDb, query: string, args: varargs[string, `$`]): Future
   return fut
 
 proc getAllRowsAsync*(db: MasterDb, query: string,
-                     args: varargs[string, `$`]): Future[seq[Row]] =
+                     args: varargs[string, `$`]): Future[seq[Row]] {.raises: [].} =
+  ## Async version of `getAllRows`. Dispatched to a worker thread.
   let fut = newFuture[seq[Row]]("getAllRowsAsync")
   let a = @args
   GC_ref(db)
@@ -221,7 +250,8 @@ proc getAllRowsAsync*(db: MasterDb, query: string,
   return fut
 
 proc getValueAsync*(db: MasterDb, query: string,
-                   args: varargs[string, `$`]): Future[string] =
+                   args: varargs[string, `$`]): Future[string] {.raises: [].} =
+  ## Async version of `getValue`. Dispatched to a worker thread.
   let fut = newFuture[string]("getValueAsync")
   let a = @args
   GC_ref(db)
@@ -490,6 +520,8 @@ const ValidTables* = [
 ]
 
 proc validateTable*(table: string) {.raises: [sqlite.DbError].} =
+  ## Validate that a table name is in the known medical schema whitelist.
+  ## Raises DbError for unknown table names to prevent SQL injection.
   if table notin ValidTables:
     raise newException(sqlite.DbError, "Invalid table name: " & table)
 
@@ -503,28 +535,38 @@ proc validateColumnName(name: string) {.raises: [sqlite.DbError].} =
       raise newException(sqlite.DbError, "Invalid column name: " & name)
 
 proc initSchema*(db: MasterDb, schema: string) {.raises: [sqlite.DbError].} =
+  ## Execute semicolon-delimited schema DDL statements.
   for statement in schema.split(";"):
     let trimmed = statement.strip()
     if trimmed.len > 0:
       db.exec(trimmed)
 
 proc initMedicalSchema*(db: MasterDb) {.raises: [sqlite.DbError].} =
+  ## Initialize the full medical master schema (all tables and indexes).
   db.initSchema(MedicalMasterSchema)
 
 proc openMedicalDb*(path: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sqlite.DbError].} =
+  ## Open a database and initialize the full medical master schema.
   let db = open(path, backend)
   initMedicalSchema(db)
   db
 
 proc openDomainDb*(path: string, schema: string, backend: DbBackend = dbSqlite): MasterDb {.raises: [sqlite.DbError].} =
+  ## Open a database with a custom schema (VersionsSchema is always included).
   let db = open(path, backend)
   db.initSchema(VersionsSchema & schema)
   db
 
 proc importCsvRows*(db: MasterDb, table: string, headers: seq[string],
                     rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
+  ## Import rows using INSERT OR REPLACE in a transaction with ROLLBACK on error.
+  ## Table and column names are validated against whitelist/format rules.
   validateTable(table)
   for h in headers: validateColumnName(h)
+  for i, row in rows:
+    if row.len != headers.len:
+      raise newException(sqlite.DbError,
+        "Row " & $i & " has " & $row.len & " columns, expected " & $headers.len)
   let placeholders = headers.mapIt("?").join(", ")
   let cols = headers.join(", ")
   let insertSql = "INSERT OR REPLACE INTO " & table & " (" & cols & ") VALUES (" & placeholders & ")"
@@ -538,12 +580,14 @@ proc importCsvRows*(db: MasterDb, table: string, headers: seq[string],
     raise
 
 proc recordCount*(db: MasterDb, table: string): int {.raises: [sqlite.DbError, ValueError].} =
+  ## Return the total number of rows in a table. Table name is validated.
   validateTable(table)
   let val = db.getValue("SELECT COUNT(*) FROM " & table)
   if val.len == 0: 0 else: parseInt(val)
 
 proc recordCountByRevision*(db: MasterDb, table: string,
                             revision: string): int {.raises: [sqlite.DbError, ValueError].} =
+  ## Return the number of rows matching a specific revision. Table name is validated.
   validateTable(table)
   let val = db.getValue(
     "SELECT COUNT(*) FROM " & table & " WHERE revision = ?", revision)
@@ -562,12 +606,14 @@ type
 
 proc registerVersion*(db: MasterDb, revision, masterType: string,
                       rowCount: int, sourceFile, checksum: string) {.raises: [sqlite.DbError].} =
+  ## Register a version in master_versions with status 'active'. Uses INSERT OR REPLACE.
   db.exec("""INSERT OR REPLACE INTO master_versions
              (revision, master_type, imported_at, row_count, source_file, checksum, status)
              VALUES (?, ?, datetime('now'), ?, ?, ?, 'active')""",
           revision, masterType, $rowCount, sourceFile, checksum)
 
 proc listVersions*(db: MasterDb, masterType: string = ""): seq[MasterVersion] {.raises: [sqlite.DbError, ValueError].} =
+  ## List versions, optionally filtered by masterType. Ordered by imported_at DESC.
   let query = if masterType.len > 0:
     "SELECT id, revision, master_type, imported_at, row_count, source_file, checksum, status FROM master_versions WHERE master_type = ? ORDER BY imported_at DESC"
   else:
@@ -589,16 +635,19 @@ proc listVersions*(db: MasterDb, masterType: string = ""): seq[MasterVersion] {.
     ))
 
 proc activeRevision*(db: MasterDb, masterType: string): string {.raises: [sqlite.DbError].} =
+  ## Return the active revision for a masterType, or empty string if none.
   db.getValue(
     "SELECT revision FROM master_versions WHERE master_type = ? AND status = 'active' ORDER BY imported_at DESC LIMIT 1",
     masterType)
 
 proc deactivateRevision*(db: MasterDb, revision, masterType: string) {.raises: [sqlite.DbError].} =
+  ## Mark a revision as 'superseded'.
   db.exec(
     "UPDATE master_versions SET status = 'superseded' WHERE revision = ? AND master_type = ?",
     revision, masterType)
 
 proc activateRevision*(db: MasterDb, revision, masterType: string) {.raises: [sqlite.DbError].} =
+  ## Atomically activate a revision (deactivates the current active one first).
   db.exec(
     "UPDATE master_versions SET status = 'superseded' WHERE master_type = ? AND status = 'active'",
     masterType)
@@ -607,6 +656,7 @@ proc activateRevision*(db: MasterDb, revision, masterType: string) {.raises: [sq
     revision, masterType)
 
 proc purgeRevision*(db: MasterDb, revision, masterType, table: string) {.raises: [sqlite.DbError].} =
+  ## Delete all data for a revision from the specified table and master_versions.
   validateTable(table)
   db.exec("DELETE FROM " & table & " WHERE revision = ?", revision)
   db.exec(
@@ -616,8 +666,13 @@ proc purgeRevision*(db: MasterDb, revision, masterType, table: string) {.raises:
 proc importCsvRowsVersioned*(db: MasterDb, table: string, revision: string,
                              headers: seq[string],
                              rows: seq[seq[string]]) {.raises: [sqlite.DbError].} =
+  ## Like `importCsvRows` but auto-adds a 'revision' column if not in headers.
   validateTable(table)
   for h in headers: validateColumnName(h)
+  for i, row in rows:
+    if row.len != headers.len:
+      raise newException(sqlite.DbError,
+        "Row " & $i & " has " & $row.len & " columns, expected " & $headers.len)
   var actualHeaders = headers
   var actualRows = rows
   if "revision" notin headers:

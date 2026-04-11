@@ -22,7 +22,10 @@ type
     address*: cstring
 
 when defined(useDqlite):
-  {.pragma: dqliteImport, importc, dynlib: "libdqlite.so".}
+  const dqliteLib* = when defined(macosx): "libdqlite.dylib"
+                     elif defined(windows): "dqlite.dll"
+                     else: "libdqlite.so"
+  {.pragma: dqliteImport, importc, dynlib: dqliteLib.}
 
   # Version
   proc dqlite_version_number*(): cint {.dqliteImport.}
