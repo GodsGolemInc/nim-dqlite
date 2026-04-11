@@ -1,0 +1,11 @@
+data/raw/
+data/csv/
+data/*.db
+scripts/import_masters
+scripts/convert_ssk
+nimcache/
+tests/test_all
+tests/test_properties
+tests/*.db
+*.db
+.DS_Store
