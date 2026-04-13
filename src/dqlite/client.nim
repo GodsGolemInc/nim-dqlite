@@ -75,7 +75,7 @@ proc newTcpTransport*(address: string, timeoutMs: int = 5000): Transport {.raise
   result.closeProc = proc() {.raises: [], gcsafe.} =
     try:
       sockRef.close()
-    except CatchableError:
+    except Exception:
       discard
 
 proc newMockTransport*(responses: seq[seq[byte]]): Transport {.raises: [].} =
