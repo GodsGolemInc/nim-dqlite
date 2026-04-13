@@ -1,10 +1,10 @@
-# ADR-0003: ARC {.cursor.} Pragma for cast[ref](pointer) Locals
+# ADR-0003: ARC Memory Safety for cast[ref](pointer) in Async Bridge
 
 ## Status
-Accepted
+Superseded (2026-04-13) — replaces initial {.cursor.} approach based on nim-lang/Nim#25733 feedback
 
 ## Date
-2026-04-11
+2026-04-11 (initial), 2026-04-13 (superseded)
 
 ## Context
 
@@ -12,49 +12,47 @@ ADR-0002 の非同期ブリッジで `cast[pointer](db)` → チャネル送信 
 
 根本原因の分析:
 
-ARC では `cast[MasterDb](ptr)` で作った `let db` がスコープ終了時に `=destroy` を呼び、refcount をデクリメントする。これは `GC_ref`/`GC_unref` とは別の経路であり、各非同期操作で **2回の過剰デクリメント** が発生していた:
+ARC では `cast[MasterDb](ptr)` で作った `let db` がスコープ終了時に `=destroy` を呼び、refcount をデクリメントする。これは `GC_ref`/`GC_unref` とは別の経路であり、worker と poller の**両方**で `=destroy` が走ることで過剰デクリメントが発生していた。
 
-```
-GC_ref(db)       → +1
-execWorker scope exit → -1  (ARC =destroy)
-pollResults scope exit → -1  (ARC =destroy)
-GC_unref(db)     → -1
-合計: +1 -1 -1 -1 = -2 (本来 0 であるべき)
-```
+初期対応として `{.cursor.}` プラグマで `=destroy` を抑止し `GC_unref` で手動管理していたが、Nim 作者 Araq から以下のフィードバックを受けた (nim-lang/Nim#25733):
 
-sequential `waitFor` では偶然タイミングが合い発現しなかったが、batched `waitFor all(futs)` では急速なrefcount変動でオブジェクトが早期解放された。
+- `cast` は "shut up I know what I'm doing" 機能であり、警告の追加は不適切
+- `{.cursor.}` ワークアラウンドも推奨しない
+- unowned メモリには `ptr` にキャストすべき
 
 ## Decision
 
-`cast[ref T](pointer)` で作った全てのローカル変数に `{.cursor.}` プラグマを付与する。
+**Worker 関数（スレッド内）**: `cast[ptr MasterDbObj]` を使用。フィールドアクセスのみで所有権不要。ARC が追跡しないため `=destroy` は呼ばれない。
+
+**pollResults（メインスレッド）**: `cast[MasterDb]` / `cast[Future[T]]` を使用し、ARC に `=destroy` を任せる。`GC_unref` は不要 — ARC の `=destroy` がスコープ終了時に refcount を自然にデクリメントする。
 
 ```nim
-# ✅ ARC がスコープ終了時に =destroy を呼ばない
-let db {.cursor.} = cast[MasterDb](msg.dbPtr)
-let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
+# Worker: ptr — ARC 追跡なし
+let db = cast[ptr MasterDbObj](msg.dbPtr)
 
-# ❌ ARC が =destroy を呼び、余分な refcount デクリメントが発生
-let db = cast[MasterDb](msg.dbPtr)
+# Poller: ref — ARC の =destroy が GC_ref 分を相殺
+let db = cast[MasterDb](res.msg.dbPtr)
+let fut = cast[Future[void]](res.msg.futPtr)
 ```
 
-`{.cursor.}` は非所有参照を宣言し、ARC の自動 `=destroy` を抑止する。ライフタイム管理は `GC_ref`/`GC_unref` が担う。
+### Refcount 推移
+
+```
+Send:    GC_ref(db)  → refcount 1→2
+Worker:  cast[ptr MasterDbObj] → ARC 追跡なし → refcount 2 のまま
+Poll:    let db = cast[MasterDb](...) → ARC 追跡あり
+         スコープ終了 → =destroy → refcount 2→1 ✓
+```
 
 ## Consequences
 
 ### Positive
+- `{.cursor.}` や `GC_unref` の手動管理が不要
+- ARC の自然なセマンティクスに沿っている
 - batched `waitFor all(futs)` パターンが安全に動作（500件並行テスト通過）
-- ARC/ORC の両方で正しいメモリ管理
 
 ### Negative
-- `{.cursor.}` の付け忘れは静かなメモリ破壊を引き起こす（コンパイラが警告しない）
+- `cast[ref T]` を使う以上、cast の意味を理解する必要がある（Araq: "it's a cast"）
 
 ### Risks
-- 将来の非同期操作追加時に `{.cursor.}` を忘れるリスク（軽減策: tdd-cycle 品質ゲートにチェック項目追加済み）
-
-## Alternatives Considered
-
-### ptr T を使い ref T にキャストしない
-- **却下理由**: `MasterDb = ref MasterDbObj` のフィールドアクセスに ref 型が必要。ptr での操作は煩雑
-
-### GC_ref を追加で呼んで相殺
-- **却下理由**: 呼び出し箇所の数え間違いでリーク or double-free。{.cursor.} の方が宣言的で安全
+- Worker で誤って `ref` にキャストすると二重デクリメントが発生する（軽減策: Worker は `ptr` のみ使用するコメントで明示）

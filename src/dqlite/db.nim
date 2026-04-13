@@ -112,10 +112,8 @@ var
 # --- Internal Worker Functions ---
 
 proc execWorker(msg: AsyncMsg) {.gcsafe.} =
-  # {.cursor.} prevents ARC from calling =destroy on scope exit for cast-created refs.
-  # Without this, each cast[MasterDb](ptr) causes an extra refcount decrement when the
-  # local goes out of scope, leading to premature object deallocation under --mm:arc.
-  let db {.cursor.} = cast[MasterDb](msg.dbPtr)
+  # Workers access fields only — cast to ptr to avoid ARC tracking.
+  let db = cast[ptr MasterDbObj](msg.dbPtr)
   try:
     withLock db.lock:
       db.conn.exec(sqlite.sql(msg.query), msg.args)
@@ -124,7 +122,7 @@ proc execWorker(msg: AsyncMsg) {.gcsafe.} =
     resultChannel.send(ResultMsg(kind: resError, origKind: msgExec, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
 
 proc getAllRowsWorker(msg: AsyncMsg) {.gcsafe.} =
-  let db {.cursor.} = cast[MasterDb](msg.dbPtr)
+  let db = cast[ptr MasterDbObj](msg.dbPtr)
   try:
     var rows: seq[Row]
     withLock db.lock:
@@ -134,7 +132,7 @@ proc getAllRowsWorker(msg: AsyncMsg) {.gcsafe.} =
     resultChannel.send(ResultMsg(kind: resError, origKind: msgGetAllRows, dbPtr: msg.dbPtr, futPtr: msg.futPtr, errorMsg: $e.name & ": " & e.msg))
 
 proc getValueWorker(msg: AsyncMsg) {.gcsafe.} =
-  let db {.cursor.} = cast[MasterDb](msg.dbPtr)
+  let db = cast[ptr MasterDbObj](msg.dbPtr)
   try:
     var val: string
     withLock db.lock:
@@ -156,37 +154,32 @@ proc pollResults(fd: AsyncFD): bool {.gcsafe.} =
   while true:
     let res = resultChannel.tryRecv()
     if res.dataAvailable:
-      let db {.cursor.} = cast[MasterDb](res.msg.dbPtr)
+      # ARC's =destroy at scope exit decrements the GC_ref'd refcount (2→1).
+      # Workers use ptr (no ARC tracking), so only this site triggers =destroy.
+      let db = cast[MasterDb](res.msg.dbPtr)
       case res.msg.kind
       of resVoid:
-        let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
+        let fut = cast[Future[void]](res.msg.futPtr)
         if not fut.finished: fut.complete()
-        GC_unref(fut)
       of resRows:
-        let fut {.cursor.} = cast[Future[seq[Row]]](res.msg.futPtr)
+        let fut = cast[Future[seq[Row]]](res.msg.futPtr)
         if not fut.finished: fut.complete(res.msg.rows)
-        GC_unref(fut)
       of resString:
-        let fut {.cursor.} = cast[Future[string]](res.msg.futPtr)
+        let fut = cast[Future[string]](res.msg.futPtr)
         if not fut.finished: fut.complete(res.msg.val)
-        GC_unref(fut)
       of resError:
         let err = newException(sqlite.DbError, res.msg.errorMsg)
         case res.msg.origKind
         of msgExec:
-          let fut {.cursor.} = cast[Future[void]](res.msg.futPtr)
+          let fut = cast[Future[void]](res.msg.futPtr)
           if not fut.finished: fut.fail(err)
-          GC_unref(fut)
         of msgGetAllRows:
-          let fut {.cursor.} = cast[Future[seq[Row]]](res.msg.futPtr)
+          let fut = cast[Future[seq[Row]]](res.msg.futPtr)
           if not fut.finished: fut.fail(err)
-          GC_unref(fut)
         of msgGetValue:
-          let fut {.cursor.} = cast[Future[string]](res.msg.futPtr)
+          let fut = cast[Future[string]](res.msg.futPtr)
           if not fut.finished: fut.fail(err)
-          GC_unref(fut)
         of msgQuit: discard
-      GC_unref(db)
     else:
       break
   # Re-schedule timer for polling
