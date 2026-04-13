@@ -127,6 +127,7 @@ Runs 52 tests: 9 unit tests (std/unittest) + 43 property-based tests (balls fram
 
 - [Architecture Decision Records](docs/adr/) (5 ADRs)
 - [Introduction blog post](docs/blog/nim-dqlite-introduction.md)
+- [ARC と cast の所有権設計](docs/blog/nim-arc-cast-ownership.md) — nim-lang/Nim#25733 を起点にした ptr/ref split パターンの解説
 
 ## License
 
